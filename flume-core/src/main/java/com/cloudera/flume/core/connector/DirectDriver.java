@@ -50,6 +50,8 @@ public class DirectDriver extends Driver {
   // metrics
   public long nextCount = 0;
   public long appendCount = 0;
+  public long appendBytes = 0;
+  public long appendCountOld = 0;
 
   public DirectDriver(EventSource src, EventSink snk) {
     this("pumper", src, snk);
@@ -62,6 +64,36 @@ public class DirectDriver extends Driver {
     thd = new PumperThread(threadName);
     this.source = src;
     this.sink = snk;
+  }
+  
+  @Override
+  public long getAppendCount() {
+  	return this.appendCount;
+  }
+  
+  @Override
+  public long getAppendCountDelta(boolean markAfterReturn) {
+  	long returnV = this.appendCount - this.appendCountOld;
+  	if( markAfterReturn ) {
+  		this.appendCountOld = this.appendCount;
+  	}
+  	return returnV;
+  }
+  
+  @Override
+  public long getAppendBytes() {
+  	return this.appendBytes;
+  }
+  
+  @Override
+  public void resetAppendCount() {
+  	this.appendCount = 0;
+  	this.appendBytes = 0;
+  }
+  
+  @Override
+  public long getNextCount() {
+  	return nextCount;
   }
 
   class PumperThread extends Thread {
@@ -101,18 +133,71 @@ public class DirectDriver extends Driver {
 
       LOG.debug("Starting driver " + DirectDriver.this);
       try {
+      Event e = null;
+
         while (!stopped) {
-          Event e = source.next();
-          if (e == null)
-            break;
+          try {
+            e = source.next();
+          } catch(InterruptedException eIn) {
+            // If we are interrupted then its time to go down. re-throw the exception.
+            // Details are logged by the outer catch block
+            throw eIn;
+          } catch (Exception eI) {
+            // If this is a chained or converted Interrupt then throw it back
+            if (eI.getCause() instanceof InterruptedException)
+              throw eI;
+
+            // If there's an exception, try to reopen the source
+            // if the open or close still raises an exception, then bail out
+            LOG.warn("Exception in source: " + source.getName(), eI);
+            LOG.warn("Retrying after Error in source: " + source.getName());
+            source.close();
+            source.open();
+            LOG.info(" Source Retry successful");
+            e = source.next(); // try to get the next event again
+          }
+
+          if ( e == null ) {
+          	LOG.warn("{}: Event is null or empty()",source.getName());
+          	if( "NullSource".equals(source.getName()) ) {
+          		break;
+          	}else {
+          		continue;
+          	}
+          }
+          
+          if( e.getBody().length==0 ) {
+          	LOG.warn("Event is empty; continue");
+          	continue;
+          }
           nextCount++;
 
-          sink.append(e);
+          try {
+              sink.append(e);
+            } catch(InterruptedException eIn) {
+              // If we are interrupted then its time to go down. re-throw the exception.
+              // Details are logged by the outer catch block
+              throw eIn;
+            } catch (Exception eI) {
+              // If this is a chained or converted Interrupt then throw it back
+              if (eI.getCause() instanceof InterruptedException)
+                throw eI;
+
+              // If there's an exception, try to reopen the source
+              // if the open or close still raises an exception, then bail out
+              LOG.warn("Exception in sink: " + sink.getName(), eI);
+              LOG.warn("Retrying after Error in source: " + sink.getName());
+              sink.close();
+              sink.open();
+              LOG.info("Sink Retry successful");
+              sink.append(e); // try to sink the event again
+            }
           appendCount++;
+          appendBytes += e.getBody().length;
         }
       } catch (Exception e1) {
         // Catches all exceptions or throwables. This is a separate thread
-        LOG.error("Closing down due to exception during append calls", e1);
+        LOG.error("Closing down due to exception during append calls");
         errorCleanup(PumperThread.this.getName(), e1);
         return;
       }
@@ -129,11 +214,11 @@ public class DirectDriver extends Driver {
         errorCleanup(PumperThread.this.getName(), e);
         return;
       }
-
-      synchronized (stateSignal) {
-        LOG.debug("Driver completed: " + DirectDriver.this);
+      synchronized (stateSignal) { 
+      	LOG.debug("Driver completed: " + DirectDriver.this);
         stopped = true;
         state = DriverState.IDLE;
+        stateSignal.notifyAll();
       }
     }
 
@@ -206,6 +291,11 @@ public class DirectDriver extends Driver {
   @Override
   public synchronized void stop() throws IOException {
     thd.stopped = true;
+    try {
+    	source.close();
+    }catch(InterruptedException ee) {
+    	LOG.error(ee.getMessage());
+    }
   }
 
   /**
@@ -298,7 +388,6 @@ public class DirectDriver extends Driver {
           LOG.warn("Expected " + state + " but already in state " + curState);
           return true;
         }
-
         // still wrong state? wait more.
         now = Clock.unixTime();
         long waitMs = Math.max(0, deadline - now); // guarentee non neg
